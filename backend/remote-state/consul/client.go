@@ -20,6 +20,12 @@ import (
 const (
 	lockSuffix     = "/.lock"
 	lockInfoSuffix = "/.lockinfo"
+
+	// the Session TTL associated with this lock
+	lockSessionTTL = "30s"
+	// the delay time from when a session is lost to when the
+	// lock is released by the server
+	lockDelay = 5 * time.Second
 )
 
 // RemoteClient is a remote client that stores data in Consul.
@@ -40,13 +46,17 @@ type RemoteClient struct {
 	modifyIndex uint64
 
 	consulLock *consulapi.Lock
-	lockCh     <-chan struct{}
+
+	lockCh <-chan struct{}
 
 	info *state.LockInfo
 
 	// cancel the goroutine which is monitoring the lock.
 	monitorCancel chan struct{}
 	monitorDone   chan struct{}
+
+	// sessionCancel is passed to Session.RenewPeriodic, and is cancelled if we lose the lock.
+	sessionCancel chan struct{}
 }
 
 func (c *RemoteClient) Get() (*remote.Payload, error) {
@@ -205,14 +215,55 @@ func (c *RemoteClient) Lock(info *state.LockInfo) (string, error) {
 // called after a lock is acquired
 var testLockHook func()
 
+func (c *RemoteClient) createSession() (string, error) {
+	session := c.Client.Session()
+	se := &consulapi.SessionEntry{
+		Name:      consulapi.DefaultLockSessionName,
+		TTL:       lockSessionTTL,
+		LockDelay: lockDelay,
+	}
+
+	id, _, err := session.Create(se, nil)
+	if err != nil {
+		return "", err
+	}
+
+	// keep the session renewed
+	go session.RenewPeriodic(lockSessionTTL, id, nil, c.sessionCancel)
+
+	return id, nil
+}
+
+func (c *RemoteClient) destroySession() {
+
+}
+
 func (c *RemoteClient) lock() (string, error) {
+	if c.sessionCancel == nil {
+		c.sessionCancel = make(chan struct{})
+	}
+
+	// We create a new session here, so it can be canceled when the lock is
+	// lost or unlocked.
+	lockSession, err := c.createSession()
+	if err != nil {
+		return "", err
+	}
+
 	if c.consulLock == nil {
 		opts := &consulapi.LockOptions{
-			Key: c.Path + lockSuffix,
+			Key:     c.Path + lockSuffix,
+			Session: lockSession,
+
 			// only wait briefly, so terraform has the choice to fail fast or
 			// retry as needed.
 			LockWaitTime: time.Second,
 			LockTryOnce:  true,
+
+			// Don't let the lock monitor give up right away. It's possible the
+			// session is still ok, even if the lock monitor failed once.
+			// The default interval between retries in 2 seconds.
+			MonitorRetries: 5,
 		}
 
 		lock, err := c.Client.LockOpts(opts)
@@ -239,6 +290,7 @@ func (c *RemoteClient) lock() (string, error) {
 		}
 
 		lockErr.Info = lockInfo
+
 		return "", lockErr
 	}
 
@@ -265,8 +317,12 @@ func (c *RemoteClient) lock() (string, error) {
 		}()
 		select {
 		case <-c.lockCh:
-			for {
+			log.Println("[ERROR] lost consul lock")
+			for retries := 0; ; retries++ {
 				c.mu.Lock()
+				// We lost our lock, so we need to cancel the session too.
+				close(c.sessionCancel)
+				c.sessionCancel = nil
 				c.consulLock = nil
 				_, err := c.lock()
 				c.mu.Unlock()
@@ -276,7 +332,7 @@ func (c *RemoteClient) lock() (string, error) {
 					// terraform is running. There may be changes in progress,
 					// so there's no use in aborting. Either we eventually
 					// reacquire the lock, or a Put will fail on a CAS.
-					log.Printf("[ERROR] attempting to reacquire lock: %s", err)
+					log.Printf("[ERROR] could not reacquire lock: %s", err)
 					time.Sleep(time.Second)
 
 					select {
